@@ -1,0 +1,908 @@
+---
+title: "social_atlas_code"
+author: "Matthew Lam"
+date: '2022-03-31'
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r}
+#load libraries
+library(tidyverse)
+library(tmap)
+library(sf)
+library(sp)
+library(rgdal)
+library(rgeos)
+library(janitor)
+library(RColorBrewer)
+library(spdep)
+
+#working directory
+setwd("~/Library/CloudStorage/OneDrive-UniversityCollegeLondon/Y2/Term 2/Geocomputation/social-atlas/social-atlas")
+
+#read in the data for vaccines
+wc15apr <- read.csv("./vax raw data/wc15apr.csv")
+
+#read in the data for case rates
+london_case_rates <- read.csv("msoa_case_rates.csv")
+
+#read in the data for ethnicity
+ethnicitiesdata <- read.csv("msoa_ethnicities_data.csv")
+
+#read in the data for population numbers 2011
+population_numbers <- read.csv("2011_population_numbers.csv")
+
+#read in the data for population numbers 2020
+population_numbers_2020 <- read.csv("2020_population_numbers.csv")
+
+#read in the data for qualification numbers
+qualification_numbers <- read.csv("qualification_numbers.csv")
+
+#read in the data for imd decile by lsoa
+lsoa_imd_decile <- read.csv("deprivation_lsoa.csv")
+
+#read in the lsoa to msoa lookup file (used later to summarise imd by msoa)
+msoa_lsoa_lookup <- read.csv("msoa_lsoa_lookup.csv")
+
+#read in the data for vax sites
+pharmacies <- read.csv("pharmacies_vax_sites.csv")
+gps <- read.csv("gp_led_vax_sites.csv")
+hospitals <- read.csv("hospital_vax_sites.csv")
+```
+
+## Data Cleaning
+
+#### Week Commencing 13 May 2020 Vaccinations
+```{r}
+#subset for london only
+wc13may_london <- wc13may %>% filter(region_name == "London")
+
+#totals for first dose
+wc13may_london$total_firstdose <- wc13may_london$under40_firstdose + wc13may_london$X40to44_firstdose + wc13may_london$X45to49_firstdose + wc13may_london$X50to54_firstdose + wc13may_london$X55to59_firstdose + wc13may_london$X60to64_firstdose + wc13may_london$X65to69_firstdose + wc13may_london$X70to74_firstdose + wc13may_london$X75to79_firstdose + wc13may_london$X80plus_firstdose
+
+#select only the relevant columns 
+london_vax_rates13may <- wc13may_london %>% dplyr::select(region_name, ltla_name, msoa_code, total_firstdose)
+
+#expressing as a proportion of total msoa population
+#first merge the data
+london_vax_rates13may <- merge(london_vax_rates13may, population_numbers_2020, by.x="msoa_code", by.y="msoa_code")
+
+#calculating the percentage population vaccinated 
+london_vax_rates13may$per_atleastfirstdose <-(london_vax_rates13may$total_firstdose / london_vax_rates13may$pop) *100
+
+#round
+london_vax_rates13may$per_atleastfirstdose <- floor(london_vax_rates13may$per_atleastfirstdose)
+```
+
+#### Qualifications
+
+```{r}
+#merging the dataset with population numbers
+qualification_msoa <- merge(population_numbers, qualification_numbers, by.x="msoa_code", by.y="msoa_code")
+
+#calculating percent no qualification 
+qualification_msoa$percent_noqual <- (qualification_msoa$persons_noqualification / qualification_msoa$pop)*100
+
+#calculating percent degreeandabove
+qualification_msoa$percent_degreeandabove <- (qualification_msoa$persons_degree_and_above / qualification_msoa$pop)*100
+
+```
+
+#### Deprivation
+
+```{r}
+#first we need to merge the lsoaimd file with the lookup file 
+lsoa_imd_lookup <- merge(lsoa_imd_decile, msoa_lsoa_lookup, by.x="lsoa_code", by.y="LSOA11CD")
+
+#inspect
+View(lsoa_imd_lookup)
+
+#next we need to summarise by msoa. First we will group it by code and name, and then summarise by the mean imd of all the LSOAs in that MSOA. 
+imd_decile_msoa <- lsoa_imd_lookup %>% group_by(MSOA11CD, MSOA11NM) %>% summarise(mean_imd_decile= mean(imd_decile))
+View(imd_decile_msoa) 
+
+
+#remove city of london by subsetting for everything that is not city of london
+imd_decile_msoa <- subset(imd_decile_msoa, MSOA11CD != "E02000001")
+
+#Round up the mean imd decile
+imd_decile_msoa$mean_imd_decile <- round(imd_decile_msoa$mean_imd_decile, digits=0)
+
+#change to a numeric variable
+imd_decile_msoa$mean_imd_decile <- as.numeric(imd_decile_msoa$mean_imd_decile)
+
+#inspect
+View(imd_decile_msoa)
+
+```
+
+#### Vax Sites
+```{r}
+#filter for London Only
+hospitals <- hospitals %>% filter(Region == "London")
+pharmacies <- pharmacies %>% filter(Region=="London")
+gps <-gps %>% filter(Region == "London")
+
+#select only postcode column
+hospitals <- hospitals[,5:6]
+pharmacies <- pharmacies[,6:7]
+gps <- gps[,6:7]
+
+
+#bind all together to one column
+allsites_raw <- rbind(hospitals, pharmacies, gps)
+View(allsites_raw)
+
+#writw as new csv for use in postcode to coordinate finder
+write.csv(allsites_raw, "allsites_raw.csv")
+```
+
+
+
+
+## Vaccines Map
+
+#### Shapefile
+
+```{r}
+#msoa load the shape
+london_msoa_shape <- read_sf("./ESRI/MSOA_2011_London_gen_MHW.shp")
+plot(london_msoa_shape)
+```
+
+#### Vaccines Map
+
+```{r}
+
+# change data types
+london_vax_rates13may  <- mutate_at(vaccines_msoa_sdf13may , vars(per_atleastfirstdose),
+    function(x) as.numeric(x))
+
+#histogram to inspect data
+hist(london_vax_rates13may$per_atleastfirstdose)
+
+#joining to the spatial dataframe
+vaccines_msoa_sdf13may <- left_join(london_msoa_shape,london_vax_rates13may, by = c("MSOA11CD" = "msoa_code"))
+
+#defining a custom palette using cartocolors colors
+mypal1 <- c("#f9ddda","#f2b9c4","#e597b9","#ce78b3","#ad5fad","#834ba0","#573b88")
+
+#vaccines map 
+vaccines_map <- tm_shape(london_msoa_shape)+
+  tm_polygons("gray", border.col="gray")+
+tm_shape(vaccines_msoa_sdf13may)+
+  tm_fill(col="per_atleastfirstdose", n=5,
+              style="jenks", title="% Population with At Least \nOne Dose", 
+              palette=mypal1, 
+              border.col="white")+
+  tm_borders(col="grey", lwd=0.3)+
+  tm_layout(main.title="Population in London with At Least One Dose \n (As of 13 May 2021)",
+            main.title.fontface=2,
+            fontfamily="Helvetica", 
+            legend.outside=TRUE, 
+            legend.outside.position = "right", 
+            legend.title.size=1, 
+            legend.title.fontface=2, 
+            frame = F)+
+  tm_scale_bar(breaks=c(0,5,10,15,20), position=c("left","bottom"))+
+  tm_compass(type="arrow", position=c("right", "top"))
+vaccines_map
+
+#save the map as a pdf
+tmap_save(vaccines_map, "vaccines_map.pdf")
+
+```
+
+## Hotspot Analysis for Vaccines
+
+```{r}
+#define neighbours
+msoa_neighbours_fd <- dnearneigh(st_geometry(st_centroid(vaccines_msoa_sdf13may)), 0, 3000)
+
+
+# creates a neighbours list
+msoa_spatial_weights_fd <- msoa_neighbours_fd %>%
+    nb2listw(., style = "B")
+
+
+# run the local Gi* test on our  data, note we again use the fd
+# weights
+vaccines_LGO <- vaccines_msoa_sdf13may %>%
+    pull(per_atleastfirstdose) %>%
+    as.vector() %>%
+    localG(., msoa_spatial_weights_fd)
+
+# print the local Gi* statistic
+head(vaccines_LGO)
+
+# join the local Gi* statistic to `obesity_ward_sdf` spatial dataframe
+vaccines_msoa_sdf <- vaccines_msoa_sdf %>%
+    mutate(vaccines_LGO_G = as.numeric(vaccines_LGO))
+
+# create a colour palette
+GIColours <- rev(brewer.pal(8, "RdBu"))
+
+#subset london boroughs to include outline
+ldnb <- read_sf("./ESRI/London_Borough_Excluding_MHW.shp")
+towerhamlets_outline <- subset(ldnb, NAME=="Tower Hamlets")
+westminster_outline <- subset(ldnb, NAME=="Westminster")
+hackney_outline <- subset(ldnb, NAME=="Hackney")
+camden_outline <- subset(ldnb, NAME=="Camden")
+
+# plot the clusters
+vax_hotspot <- tm_shape(vaccines_msoa_sdf) + 
+  tm_polygons("vaccines_LGO_G", style = "pretty", palette=GIColours,
+              midpoint=0, title = "Local Gi* statistic") +
+  tm_layout(main.title = 'Hot/Cold Spot Map of COVID-19 Vaccination Rates in London', 
+            main.title.fontface = 2, fontfamily = "Helvetica",
+            legend.outside = TRUE, 
+            legend.outside.position = "right", 
+            legend.title.size = 1, 
+            legend.title.fontface = 2, 
+            frame=F) + 
+  tm_compass(type = "arrow", position = c("right", "bottom")) +
+  tm_scale_bar(breaks = c(0, 5, 10, 15, 20), position = c("left", "bottom"))+
+  tm_shape(towerhamlets_outline)+
+  tm_borders(col="yellow")+
+  tm_shape(westminster_outline)+
+  tm_borders(col="yellow")+
+  tm_shape(hackney_outline)+
+  tm_borders(col="yellow")
+
+#save as pdf
+tmap_save(vax_hotspot, "vax_hotspot.pdf")
+```
+
+## Global Moran's I
+
+```{r}
+#joining to the spatial dataframe
+vaccines_msoa_sdf13may <- left_join(london_msoa_shape,london_vax_rates13may, by = c("MSOA11CD" = "msoa_code"))
+
+# remove NAs
+vaccines_msoa_sdf13may <- vaccines_msoa_sdf13may %>%
+    filter(!is.na(per_atleastfirstdose))
+
+# calculate the centroids of all of the msoas in London
+msoa_centroid <- vaccines_msoa_sdf13may %>%
+    st_centroid()
+
+# create a neighbours list based on the Queen neighbour definition
+msoa_neighbours_queen <- vaccines_msoa_sdf13may %>%
+    poly2nb(., queen = T, snap=10)
+
+# creates a neighbours list: Fixed Distance
+msoa_spatial_weights_fd <- msoa_neighbours_fd %>%
+    nb2listw(., style = "B")
+
+# plot neighbours: Queen
+plot(msoa_neighbours_fd, st_geometry(msoa_centroid), col = "red", pch = 20, cex = 0.5)
+
+
+#Queen's neighbour list
+msoa_spatial_weights_queen <- msoa_neighbours_queen %>% 
+  nb2listw(., style="C")
+
+#plot
+vaccines_MI_sp <- moran.plot(vaccines_msoa_sdf13may$per_atleastfirstdose, listw = msoa_spatial_weights_queen)
+
+
+# run the global Moran's I test 
+vaccines_GMI <- vaccines_msoa_sdf13may %>%
+    pull(per_atleastfirstdose) %>%
+    as.vector() %>%
+    moran.test(., msoa_spatial_weights_queen)
+
+# print global Moran's I result
+vaccines_GMI
+
+#export table using stargazer
+library(stargazer)
+stargazer(vaccines_GMI)
+```
+
+
+
+## Local Moran's I
+
+```{r}
+
+
+# run the local Moran's I test 
+vax_LMI <- vaccines_msoa_sdf13may  %>%
+    pull(per_atleastfirstdose) %>%
+    as.vector() %>%
+    localmoran(.,msoa_spatial_weights_queen)
+
+# coerce into dataframe
+vax_LMI <- as.data.frame(vax_LMI)
+
+# update the names for easier reference
+names(vax_LMI) <- c("LMI_Ii", "LMI_eIi", "LMI_varIi", "LMI_zIi", "LMI_sigP")
+
+# join to obesity_ward_sdf
+vaccines_msoa_sdf13may <- vaccines_msoa_sdf13may %>%
+    mutate(vax_LMI)
+
+# significance breaks
+breaks <- c(0, 0.05, 0.1, 1)
+
+# colours for our local Moran's I statistic
+colours <- c('white', "#a6bddb", "#2b8cbe" )
+
+# map our local Moran's I statistic 
+tm_shape(vaccines_msoa_sdf13may) + 
+  tm_polygons("LMI_sigP", style = "fixed", breaks = breaks, 
+              palette = rev(colours), title = "p-value of Local Moran's I stat") + 
+  tm_borders(col="grey", lwd=0.3)+
+  tm_layout(main.title = "Spatial Autocorrelation of \nVaccination Rates in London", 
+            main.title.fontface = 2, fontfamily = "Helvetica", 
+            legend.outside = TRUE, 
+            legend.outside.position = "right", 
+            legend.title.size = 1, 
+            legend.title.fontface = 2, frame=F) + 
+  tm_compass(type = "arrow", position = c("right", "bottom")) + 
+  tm_scale_bar(breaks = c(0, 5, 10, 15, 20), position = c("left", "bottom"))
+
+
+# compare local value for obesity with mean value
+vaccines_msoa_sdf13may <- vaccines_msoa_sdf13may %>% mutate(obs_diff = (per_atleastfirstdose - mean(vaccines_msoa_sdf13may$per_atleastfirstdose)))
+
+# compare local LMI value with mean LMI value
+vaccines_msoa_sdf13may <- vaccines_msoa_sdf13may %>% mutate(LMI_diff = (vax_LMI$LMI_Ii - mean(vax_LMI$LMI_Ii)))
+
+# set a significance threshold 
+signif <- 0.05
+
+# generate column with cluster type, using values above
+vaccines_msoa_sdf13may <- vaccines_msoa_sdf13may %>% 
+  mutate(cluster_type = case_when(obs_diff > 0 & LMI_diff > 0 & LMI_sigP < signif ~ "High-High",
+                                  obs_diff < 0 & LMI_diff < 0 & LMI_sigP < signif ~ "Low-Low",
+                                  obs_diff < 0 & LMI_diff > 0 & LMI_sigP < signif ~ "Low-High",
+                                  obs_diff > 0 & LMI_diff < 0 & LMI_sigP < signif ~ "High-Low",
+                                  LMI_sigP > signif ~ "No Significance"))
+
+
+# count the different values within our `cluster_type` variable
+count(vaccines_msoa_sdf13may, cluster_type)
+
+# create a colour palette
+pal <- c("#d7191c", "#fdae61", "#abd9e9", "#2c7bb6","#F5F5F5")
+
+# plot the clusters
+lisamap <- tm_shape(vaccines_msoa_sdf13may) +
+  tm_fill(col = "cluster_type", palette = pal, title = "Cluster Type") +
+  tm_borders(col="grey", lwd=.7)+
+  tm_layout(main.title = "Cluster Map of Vaccination Rates in London",
+            main.title.fontface = 2, fontfamily = "Helvetica", legend.outside = TRUE,
+            legend.outside.position = "right",
+            legend.title.size = 1,
+            legend.title.fontface = 2, 
+            frame=F) +
+    tm_shape(towerhamlets_outline)+
+  tm_borders(col="black")+
+  tm_shape(westminster_outline)+
+  tm_borders(col="black")+
+  tm_shape(hackney_outline)+
+  tm_borders(col="black")+
+  tm_compass(type = "arrow", position = c("right", "bottom")) +
+  tm_scale_bar(breaks = c(0, 5, 10, 15, 20), position = c("left", "bottom"))
+
+#save as pdf
+tmap_save(lisamap, "lisamap.pdf")
+```
+
+## Breakdown by Borough Graph
+
+```{r}
+#vax totals in each borough
+vax_by_borough <- london_vax_rates13may %>% group_by(lad_name) %>% summarise(total_firstdose = sum(total_firstdose), pop = sum(pop))
+View(vax_by_borough)
+
+#vax totals in each borough divide by population 
+vax_by_borough$per_atleastfirstdose <- (vax_by_borough$total_firstdose / vax_by_borough$pop)*100
+
+#round to nearestinteger
+vax_by_borough$per_atleastfirstdose <- floor(vax_by_borough$per_atleastfirstdose)
+
+
+#make a bar graph ordered by vax rate per borough
+plot1 <- vax_by_borough %>% 
+  mutate(lad_name = fct_reorder(lad_name, desc(per_atleastfirstdose))) %>%
+  ggplot(aes(x=lad_name, y=per_atleastfirstdose))+
+  geom_bar(stat="identity", fill="#f68060")+
+  coord_flip()+
+  xlab("")+
+  ylab("Percent of Population Vaccinated with At Least One Dose")+
+  ggtitle("Breakdown of Vaccination Rates by London Boroughs")
+
+#save as pdf
+ggsave("plot1.pdf",plot1)
+    
+```
+
+## Black and Black British Map
+
+```{r}
+#using tmap
+black <- tm_shape(london_msoa_shape)+
+  tm_polygons("gray", border.col="gray")+
+  tm_shape(ethnicity_msoa_sdf)+
+  tm_fill(c("per_black"), 
+            style="jenks", 
+            palette=mypal2, 
+            title=c("% Population Black/Black British"))+
+  tm_borders(col="grey", lwd=0.3)+
+  tm_scale_bar(breaks=c(0,5,10,15,20), position=c("left","bottom"))+
+  tm_compass(type="arrow", position=c("right", "top"))+
+  tm_layout(main.title="Distribution of Black/Black British \nPopulations in London",
+            main.title.fontface=2,
+            fontfamily="Helvetica", legend.outside=T, legend.outside.position = c("right", "bottom"), frame=F)
+
+#save as pdf
+tmap_save(black, "black.pdf")
+```
+
+
+
+## Young People
+
+```{r}
+#read in the data
+youth <- read.csv("youthdata.csv")
+
+#calculate proportion of population aged 16 to 29 based on 2011 estimates
+youth$per_16to29 <- (youth$nr_16to19 / youth$X2011_midyear_estimate)*100
+
+write.csv(youth, "youthdata_msoa.csv")
+
+#map
+#joining to the spatial dataframe
+youth_msoa_sdf <- left_join(london_msoa_shape, youth, by = c("MSOA11CD" = "msoa_code"))
+
+#defining a custom palette using cartocolors colors
+mypal9 <- c("#ecda9a","#efc47e","#f3ad6a","#f7945d","#f97b57","#f66356","#ee4d5a")
+
+#youth map
+youth <- tm_shape(london_msoa_shape)+
+  tm_polygons("gray", border.col="gray")+
+tm_shape(youth_msoa_sdf)+
+  tm_fill(col="per_16to29", n=5,
+              style="jenks", title="% Population Aged 16 to 29", 
+              palette=mypal9, 
+              border.col="gray")+
+  tm_borders(col="gray", lwd=0.3)+
+  tm_layout(main.title="London Population Aged 16 to 29",
+            main.title.fontface=2,
+            fontfamily="Helvetica", 
+            legend.outside=TRUE, 
+            legend.outside.position = "right", 
+            legend.title.size=1, 
+            legend.title.fontface=2, 
+            frame=F)+
+  tm_scale_bar(breaks=c(0,5,10,15,20), position=c("left","bottom"))+
+  tm_compass(type="arrow", position=c("right", "top"))
+
+#save as pdf
+tmap_save(youth, "youth.pdf")
+
+```
+
+## Young People hotspot analysis
+
+```{r}
+#define neighbours
+msoa_neighbours_fd <- dnearneigh(st_geometry(st_centroid(youth_msoa_sdf)), 0, 3000)
+
+
+# creates a neighbours list
+msoa_spatial_weights_fd <- msoa_neighbours_fd %>%
+    nb2listw(., style = "B")
+
+
+# run the local Gi* test on our  data, note we again use the fd
+# weights
+youth_LGO <- youth_msoa_sdf %>%
+    pull(per_16to29) %>%
+    as.vector() %>%
+    localG(., msoa_spatial_weights_fd)
+
+
+# join the local Gi* statistic to `obesity_ward_sdf` spatial dataframe
+youth_msoa_sdf <- youth_msoa_sdf %>%
+    mutate(youth_LGO_G = as.numeric(youth_LGO))
+
+# create a colour palette
+GIColours <- rev(brewer.pal(8, "RdBu"))
+
+#subset london boroughs to include outline
+ldnb <- read_sf("./ESRI/London_Borough_Excluding_MHW.shp")
+towerhamlets_outline <- subset(ldnb, NAME=="Tower Hamlets")
+westminster_outline <- subset(ldnb, NAME=="Westminster")
+hackney_outline <- subset(ldnb, NAME=="Hackney")
+camden_outline <- subset(ldnb, NAME=="Camden")
+
+# plot the clusters
+youth_hotspot <- tm_shape(youth_msoa_sdf) + 
+  tm_polygons("youth_LGO_G", style = "pretty", palette=GIColours,
+              midpoint=0, title = "Local Gi* statistic") +
+  tm_layout(main.title = 'Hot/Cold Spot Map of Youth Population in London', 
+            main.title.fontface = 2, fontfamily = "Helvetica",
+            legend.outside = TRUE, 
+            legend.outside.position = "right", 
+            legend.title.size = 1, 
+            legend.title.fontface = 2, 
+            frame=F) + 
+  tm_compass(type = "arrow", position = c("right", "bottom")) +
+  tm_scale_bar(breaks = c(0, 5, 10, 15, 20), position = c("left", "bottom"))+
+  tm_shape(towerhamlets_outline)+
+  tm_borders(col="yellow")+
+  tm_shape(westminster_outline)+
+  tm_borders(col="yellow")+
+  tm_shape(hackney_outline)+
+  tm_borders(col="yellow")
+
+#save as pdf
+tmap_save(youth_hotspot, "youth_hotspot.pdf")
+
+```
+
+## Education
+```{r}
+#joining to the spatial dataframe
+education_msoa_sdf <- left_join(london_msoa_shape, qualification_msoa, by = c("MSOA11CD" = "msoa_code"))
+
+#defining a custom palette using cartocolors colors
+mypal3 <- c("#ede5cf","#e0c2a2","#d39c83","#c1766f","#a65461","#813753","#541f3f")
+
+#no qualification
+noqual <- tm_shape(london_msoa_shape)+
+  tm_polygons("gray", border.col="gray")+
+tm_shape(education_msoa_sdf)+
+  tm_fill(col="percent_noqual", n=5,
+              style="jenks", title="% Population with no qualification", 
+              palette=mypal3, 
+              border.col="gray")+
+  tm_borders(col="grey", lwd=0.3)+
+  tm_layout(main.title="London Population with No Qualification",
+            main.title.fontface=2,
+            fontfamily="Helvetica", 
+            legend.outside=TRUE, 
+            legend.outside.position = "right", 
+            legend.title.size=1, 
+            legend.title.fontface=2, 
+            frame=F)+
+  tm_scale_bar(breaks=c(0,5,10,15,20), position=c("left","bottom"))+
+  tm_compass(type="arrow", position=c("right", "top"))
+
+#save as pdf
+tmap_save(noqual, "noqual.pdf")
+
+#define a new palette
+mypal4 <- c("#e4f1e1","#b4d9cc","#89c0b6","#63a6a0","#448c8a","#287274","#0d585f")
+
+#Degree and Above map
+tm_shape(london_msoa_shape)+
+  tm_polygons("gray", border.col="gray")+
+tm_shape(education_msoa_sdf)+
+  tm_fill(col="percent_degreeandabove", n=5,
+              style="jenks", title="% Population with a degree and above ", 
+              palette=mypal3, 
+              border.col="gray")+
+  tm_layout(main.title="London Population with a\nDegree and Above",
+            main.title.fontface=2,
+            fontfamily="Helvetica", 
+            legend.outside=TRUE, 
+            legend.outside.position = "right", 
+            legend.title.size=1, 
+            legend.title.fontface=2, 
+            frame=F)+
+  tm_borders(col="gray", lwd=0.3)+
+  tm_scale_bar(breaks=c(0,5,10,15,20), position=c("left","bottom"))+
+  tm_compass(type="arrow", position=c("right", "top"))
+```
+
+## Deprivation
+
+```{r}
+#joining to the spatial dataframe
+deprivation_msoa_sdf <- left_join(london_msoa_shape, imd_decile_msoa, by = c("MSOA11CD" = "MSOA11CD"))
+
+#define a new palette
+mypal5 <- c("#f3cbd3","#eaa9bd","#dd88ac","#ca699d","#b14d8e","#91357d","#6c2167")
+
+#map using pdf
+imd <- tm_shape(london_msoa_shape)+
+  tm_polygons("gray", border.col="gray")+
+tm_shape(deprivation_msoa_sdf)+
+  tm_fill(col="mean_imd_decile",
+              style="jenks", title="Mean Index of Multiple Deprivation \n (where 10 is the Most Deprived Decile) ", 
+              palette=mypal5, 
+              border.col="white")+
+  tm_borders(col="grey", lwd=0.3)+
+  tm_layout(main.title="Mean Index of Multiple Deprivation in London",
+            main.title.fontface=2,
+            fontfamily="Helvetica", 
+            legend.outside=TRUE, 
+            legend.outside.position = "right", 
+            legend.title.size=1, 
+            legend.title.fontface=2, 
+            frame=F)+
+  tm_scale_bar(breaks=c(0,5,10,15,20), position=c("left","bottom"))+
+  tm_compass(type="arrow", position=c("right", "top"))
+
+#save as pdf
+tmap_save(imd, "imd.pdf")
+
+
+```
+
+## Deaths Map
+
+```{r}
+#joining to the spatial dataframe
+deaths_msoa_sdf <- left_join(london_msoa_shape, london_deaths, by = c("MSOA11CD" = "MSOA11CD"))
+
+#define a new palette
+mypal7 <- c("#fef6b5","#ffdd9a","#ffc285","#ffa679","#fa8a76","#f16d7a","#e15383")
+
+
+#map using pdf
+deaths <- tm_shape(london_msoa_shape)+
+  tm_polygons("gray", border.col="gray")+
+tm_shape(deaths_msoa_sdf)+
+  tm_fill(col="covid_19_deaths_per_thousand",
+              style="jenks", title="Deaths per 1000 People", 
+              palette="Greys", 
+              border.col="white")+
+  tm_borders(col="grey", lwd=0.3)+
+  tm_layout(main.title="COVID-19 Deaths per 1000 People from \n1 March to 17 April 2020",
+            main.title.fontface=2,
+            fontfamily="Helvetica", 
+            legend.outside=TRUE, 
+            legend.outside.position = "right", 
+            legend.title.size=1, 
+            legend.title.fontface=2, 
+            frame=F)+
+  tm_scale_bar(breaks=c(0,5,10,15,20), position=c("left","bottom"))+
+  tm_compass(type="arrow", position=c("right", "top"))
+
+#save as pdf
+tmap_save(deaths, "deaths.pdf")
+```
+
+## Area of Interest Map
+
+```{r}
+#plot the aoi using tmap
+ aoi <- tm_shape(ldnb)+
+  tm_polygons("white", border.col="grey", lwd=1)+
+  tm_text("NAME", size=0.6)+
+  tm_layout(main.title="Area of Interest: London,UK",
+            main.title.fontface=2,
+            fontfamily="Helvetica", 
+            legend.outside=TRUE, 
+            legend.outside.position = "right", 
+            legend.title.size=1, 
+            legend.title.fontface=2, 
+            frame=F)+
+  tm_scale_bar(breaks=c(0,5,10,15,20), position=c("left","bottom"))+
+  tm_compass(type="arrow", position=c("right", "top"))
+
+#save as pdf
+tmap_save(aoi, "aoi_map.pdf")
+```
+
+
+## Bivariate Mapping
+```{r}
+#clean lsoa data to only include area codes for London
+#load london lsoas
+lsoa_shape <- read_sf("./ESRI/LSOA_2011_London_gen_MHW.shp")
+
+
+#joining hospitals data to london lsoas
+hospitals_sdf<- inner_join(lsoa_shape,lsoa_data, by = c("LSOA11CD" = "AreaCodes"))
+
+
+#mapping to see if it worked
+hospitals_map <- tm_shape(lsoa_shape)+
+  tm_polygons("gray", border.col="gray")+
+tm_shape(hospitals_sdf)+
+  tm_fill(col="hospitalization", n=5,
+              style="jenks", title="Hospitalisations", 
+              palette=mypal1, 
+              border.col="white")+
+  tm_borders(col="grey", lwd=0.3)
+
+
+#first we need to merge the lsoaimd file with the lookup file 
+lsoa_hospitals_lookup<- inner_join(msoa_lsoa_lookup,lsoa_data, by = c("LSOA11CD" = "AreaCodes"))
+
+
+#now aggregate lsoas to msoas (to join with vaccine data)
+hospitalizations_msoa <- lsoa_hospitals_lookup %>% group_by(MSOA11CD, MSOA11NM) %>% summarise(mean_hospitalization= mean(hospitalization))
+
+#join msoa now to make an sdf
+hospitals_sdf_msoa<- inner_join(london_msoa_shape,hospitalizations_msoa, by = c("MSOA11CD" = "MSOA11CD"))
+
+#mapping to see if it worked
+hospitals_map_msoa <- tm_shape(london_msoa_shape)+
+  tm_polygons("gray", border.col="gray")+
+tm_shape(hospitals_sdf_msoa)+
+  tm_fill(col="mean_hospitalization", n=5,
+              style="jenks", title="Mean Hospitalisations", 
+              palette=mypal1, 
+              border.col="white")+
+  tm_borders(col="grey", lwd=0.3)
+
+#join with vaccines data
+hospitals_and_vaccines_data<- left_join(hospitalizations_msoa,vaccines_msoa_sdf13may, by = c("MSOA11CD" = "MSOA11CD"))
+
+#join msoa now to make an sdf
+hospitals_and_vaccines_sdf<- left_join(london_msoa_shape,hospitals_and_vaccines_data, by = c("MSOA11CD" = "MSOA11CD"))
+
+
+#now make a bivariate map
+library(biscale)
+
+# create classes
+data <- bi_class(hospitals_and_vaccines_sdf, x = mean_hospitalization, y = per_atleastfirstdose, style = "quantile", dim = 3)
+
+#now make a map
+library(ggsn)
+# create the basemap
+map <- ggplot() +
+  geom_sf(data = data, mapping = aes(fill = bi_class), color = "white", size = 0.1, show.legend = FALSE) +
+  bi_scale_fill(pal = "DkBlue", dim = 3) +
+  labs(
+    title = "Bivariate Plot"
+  ) +
+  bi_theme()
+
+#add scale and compass
+m1 <- map+ 
+scalebar(data, 
+         x.min = -46.85, x.max = -46.38,
+         y.min = -24, y.max = -23.35, 
+         dist = 10, dist_unit = "km",
+             transform = FALSE, model = "WGS84", st.bottom = T)+
+  blank()+
+  north(data)
+
+#save map as pdf
+ggsave("m1.pdf")
+
+#creating the legend
+legend <- bi_legend(pal = "DkBlue",
+                    dim = 3,
+                    xlab = "Higher Hospitalization Rate ",
+                    ylab = "Higher % Pop. Vaccinated ",
+                    size = 8)
+
+
+
+# combine map with legend
+library(cowplot)
+finalPlot <- ggdraw() +
+  draw_plot(map, 0, 0, 1, 1) +
+  draw_plot(legend, 0.2, .65, 0.2, 0.2)
+```
+
+
+## KDE
+```{r}
+
+#read in the london borough outline
+ldnb <- readOGR("ESRI" ,"London_Borough_Excluding_MHW")
+plot(ldnb)
+
+#coordinates of all sites
+allsites_coords <- read.csv("allsites_coords.csv")
+
+#remove NAs
+allsites_coords <- allsites_coords[complete.cases(allsites_coords),]
+
+#convert this to points
+allsites_coords %>% st_as_sf(coords = c("Latitude", "Longitude"), crs = 4236) %>%
+  # convert into BNG
+  st_transform(27700)
+
+allsites_coords <- st_as_sf(allsites_coords, coords=c("Longitude", "Latitude"), crs=4236)
+
+allsites_coords %>% st_set_crs(4326) %>% st_transform(crs=27700) %>% st_crs(27700)
+plot(allsites_coords)
+
+#plot on a map
+  tm_shape(ldnb)+
+  tm_polygons("white", border.col="grey", lwd=1)+
+  tm_shape(allsites_coords)+
+  tm_dots(col="red")
+
+#first, fix the projection - set everything to 27700
+allsites_coords <- st_transform(allsites_coords, "+init=epsg:27700", st_crs(27700))
+ldnb <- st_crs(ldnb, 27700)
+allsites_coords <- st_crs(allsites_coords, "+init=epsg:27700", st_crs(27700))
+ldnb <- st_crs(ldnb, "+init=epsg:27700", st_crs(27700))
+projection(ldnb) <- CRS("+init=EPSG:27700")
+
+#checking the reprojections
+st_crs(allsites_coords) #now 27700
+st_crs(ldnb) #27700
+
+
+#remove the points which lie outside of London
+allsites_coords %>%  st_intersection(ldnb)
+
+
+#KDE
+# create a window of observation
+window <- as.owin(ldnb)
+
+# extract coordinates from our bike theft data set as a matrix
+vaxsites_xy <- allsites_coords %>%
+    st_coordinates()
+
+# create a ppp object
+vaxsites_ppp <- ppp(x = vaxsites_xy[, 1], y = vaxsites_xy[, 2], window = window)
+
+# plot our ppp object
+plot(vaxsites_ppp)
+
+
+#dealing with duplicates
+# check for duplicates using
+anyDuplicated(vaxsites_ppp)
+
+# add an offset to our points using the rjitter function
+vaxsites_ppp_jitter <- rjitter(vaxsites_ppp, retry = TRUE, nsim = 1, drop = TRUE)
+
+# count the number of duplicated points of the new jitter data set
+anyDuplicated(vaxsites_ppp_jitter)
+
+# plot the resulting ppp object
+plot(vaxsites_ppp_jitter)
+
+# kernel density estimation of our bike theft ppp object with 1000m bandwith
+plot(density.ppp(vaxsites_ppp_jitter, sigma = 1000))
+
+
+# create a raster directly from the output of our KDE
+kde_1500g_raster <- density.ppp(vaxsites_ppp_jitter, sigma = 600, edge = T) %>%
+    raster()
+
+# plot the resulting raster
+plot(kde_1000g_raster)
+
+
+# set the CRS of the kde_400g_raster to BNG
+crs(kde_1500g_raster) <- "+init=EPSG:27700"
+
+
+# map our kde_400g_raster using tmap
+kde_map <- tm_shape(kde_1500g_raster) + tm_raster("layer", palette = "YlOrRd")+
+   tm_shape(ldnb)+tm_borders(alpha=0.3, col="grey")+
+  tm_layout(legend.outside=T, frame=F, main.title="Kernel Density Estimation of \nVaccination Sites in London (As of April 2022)")+
+  tm_compass(position=c("right", "top"))+
+  tm_scale_bar(breaks=c(5,10,15,20), position=c("left", "bottom"))
+
+#save as pdf
+tmap_save(kde_map, "kde_map.pdf")
+
+```
+
+
+```{r}
+```
+
+
+
